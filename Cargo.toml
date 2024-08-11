@@ -1,0 +1,19 @@
+[package]
+name = "tiny-logs"
+description = "Simple async logger for Tiny Cloud"
+authors = ["hex0x0000 <hex0x0000@protonmail.com>"]
+license = "GPL-3.0"
+repository = "https://github.com/personal-tiny-cloud/tiny-logs"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.29", features = [ "fs", "io-std", "io-util", "sync", "rt" ] }
+log = { version = "0.4", features = [ "std" ] }
+owo-colors = { version = "4", features = [ "supports-colors" ] }
+time = { version = "0.3", features = [ "local-offset", "macros", "formatting" ] }
+
+[dev-dependencies]
+tokio = { version = "1.29", features = [ "macros", "rt-multi-thread" ] }
+tokio-test = "0.4.4"
+tempfile = "3"
