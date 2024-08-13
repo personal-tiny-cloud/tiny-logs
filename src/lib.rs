@@ -19,6 +19,7 @@
 //
 // Email: hex0x0000@protonmail.com
 
+#![warn(missing_docs)]
 //! # Simple logger for Tiny Cloud.
 //!
 //! This is the default logger of [Tiny Cloud](https://github.com/personal-tiny-cloud/tiny-cloud).
@@ -31,13 +32,15 @@
 //! ```rust
 //! # tokio_test::block_on(async {
 //! # let tmp = tempfile::NamedTempFile::new().unwrap();
-//! # let path_to_logfile = tmp.path().as_os_str().to_str().unwrap();
+//! # let path_to_logfile = tmp.path().as_os_str().to_str().unwrap().to_string();
+//! use log::LevelFilter;
+//!
 //! // Level filter for the terminal's output - path to a log file - level filter of the log file
 //! // Remember to show the error to the user if there's any.
-//! let logger = tiny_logs::init("info", Some(path_to_logfile), Some("warn")).await.unwrap();
-//! 
+//! let logger = tiny_logs::init(LevelFilter::Info, Some(path_to_logfile), Some(LevelFilter::Warn)).await.unwrap();
+//!
 //! // -- Anywhere in the code --
-//! 
+//!
 //! log::info!("Some useful info");
 //! log::error!("An error");
 //!
@@ -125,19 +128,10 @@ fn create_log_colored(record: &Record) -> String {
         " ".into()
     };
 
-    format!("{level} [{now}]{module_path}- {args}\n", args = record.args())
-}
-
-fn get_level(level: &str) -> Result<LevelFilter, String> {
-    match level {
-        "off" => Ok(LevelFilter::Off),
-        "trace" => Ok(LevelFilter::Trace),
-        "debug" => Ok(LevelFilter::Debug),
-        "info" => Ok(LevelFilter::Info),
-        "warn" => Ok(LevelFilter::Warn),
-        "error" => Ok(LevelFilter::Error),
-        _ => Err(format!("'{level}' is not a valid filter. Accepted values are: `off`, `trace`, `debug`, `info`, `warn`, `error`."))
-    }
+    format!(
+        "{level} [{now}]{module_path}- {args}\n",
+        args = record.args()
+    )
 }
 
 enum LogMsg {
@@ -158,7 +152,8 @@ async fn write_log<D: AsyncWrite>(dest: &mut Pin<&mut D>, log: String) {
 }
 
 /// Receives [`LogMsg`]s and writes them
-async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>, stdout: io::Stdout) {
+async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
+    let stdout = io::stdout();
     pin!(stdout);
     if let Some(file) = file {
         pin!(file);
@@ -187,13 +182,9 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>, stdout:
 
 /// Initializes Tiny Logger.
 ///
-/// - `level`: Log level (See [`Level`]).
+/// - `level`: Log level filter (See [`LevelFilter`]).
 /// - `file`: Outputs logs to this path (Optional, if [`None`] outputs just to the standard output).
-/// - `file_level`: Log level of the file (Optional, if [`None`] uses `level`, or `off` if file is none).
-///
-/// # Log Levels
-///
-/// Accepted values for the log levels are: `off`, `trace`, `debug`, `info`, `warn`, `error`.
+/// - `file_level`: Log level filter of the file (Optional, if [`None`] uses `level`, or `off` if file is none) (See [`LevelFilter`]).
 ///
 /// # Return
 ///
@@ -202,48 +193,38 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>, stdout:
 ///
 /// On error it returns an error message that can be displayed to the user.
 pub async fn init(
-    level: &str,
-    file: Option<&str>,
-    file_level: Option<&str>,
+    level: LevelFilter,
+    file: Option<String>,
+    file_level: Option<LevelFilter>,
 ) -> Result<LoggerHandler, String> {
     let file: Option<File> = match file {
-        Some(path) => {
-            let path: String = path.into();
-            Some(
-                File::options()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .await
-                    .map_err(|e| format!("Failed to open log file: {e}"))?,
-            )
-        }
+        Some(path) => Some(
+            File::options()
+                .create(true)
+                .append(true)
+                .open(path)
+                .await
+                .map_err(|e| format!("Failed to open log file: {e}"))?,
+        ),
         None => None,
     };
     let (send, recv) = unbounded_channel::<LogMsg>();
 
-    let level = get_level(level)?;
+    let file_level = if file.is_some() {
+        file_level.unwrap_or(level)
+    } else {
+        LevelFilter::Off
+    };
     let logger = Box::new(TinyLogger {
         level,
-        file_level: match file_level {
-            Some(level) => get_level(level)?,
-            None => {
-                if file.is_some() {
-                    level
-                } else {
-                    LevelFilter::Off
-                }
-            }
-        },
+        file_level,
         sender: send.clone(),
     });
     log::set_boxed_logger(logger)
-        .map(|_| log::set_max_level(LevelFilter::Trace))
+        .map(|_| log::set_max_level(std::cmp::max(level, file_level)))
         .map_err(|e| format!("Failed to initialize logger: {e}"))?;
 
-    let stdout = io::stdout();
-    let joinhandle = task::spawn(async move { writer(recv, file, stdout).await });
-
+    let joinhandle = task::spawn(async move { writer(recv, file).await });
     Ok(LoggerHandler {
         sender: send,
         joinhandle,
@@ -274,8 +255,8 @@ impl LoggerHandler {
 
 /// Tiny Logger instance.
 ///
-/// You don't have to use this struct directly. The [`init`] function initializes the logger on its
-/// own. After initializing, to log things use the [`log`] crate.
+/// You don't have to use this struct directly. [`init`] initializes the logger on its own.
+/// After initializing, use the [`log`] crate and its macros for logging.
 pub struct TinyLogger {
     level: LevelFilter,
     file_level: LevelFilter,
@@ -289,10 +270,11 @@ impl log::Log for TinyLogger {
     }
 
     fn log(&self, record: &Record) {
-        if self.sender.is_closed() {
+        let metadata = record.metadata();
+        if self.sender.is_closed() || !self.enabled(metadata) {
             return;
         }
-        let lvl = record.metadata().level();
+        let lvl = metadata.level();
         let stdout_level = lvl <= self.level;
         let file_level = lvl <= self.file_level;
         if stdout_level && file_level {
@@ -315,6 +297,7 @@ impl log::Log for TinyLogger {
 /// You can either run them one at a time or use some tool to do that (like [nextest](https://nexte.st/))
 #[cfg(test)]
 mod tests {
+    use log::LevelFilter;
     use tempfile::NamedTempFile;
     use tokio::{fs::File, io::AsyncReadExt};
 
@@ -324,7 +307,9 @@ mod tests {
     async fn logging1() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init("trace", Some(path), None).await.unwrap();
+        let handle = init(LevelFilter::Trace, Some(path.to_string()), None)
+            .await
+            .unwrap();
         log::trace!("hello");
         log::debug!("hello");
         log::info!("hello");
@@ -346,12 +331,18 @@ mod tests {
         assert!(lines[4].starts_with("[ERROR]") && lines[0].ends_with("hello"));
         tmp.close().unwrap();
     }
-    
+
     #[tokio::test(flavor = "multi_thread")]
     async fn logging2() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init("off", Some(path), Some("trace")).await.unwrap();
+        let handle = init(
+            LevelFilter::Off,
+            Some(path.to_string()),
+            Some(LevelFilter::Trace),
+        )
+        .await
+        .unwrap();
         log::trace!("hello");
         log::debug!("hello");
         log::info!("hello");
@@ -373,19 +364,25 @@ mod tests {
         assert!(lines[4].starts_with("[ERROR]") && lines[0].ends_with("hello"));
         tmp.close().unwrap();
     }
-    
+
     #[tokio::test(flavor = "multi_thread")]
     async fn level1() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init("info", Some(path), Some("warn")).await.unwrap();
+        let handle = init(
+            LevelFilter::Info,
+            Some(path.to_string()),
+            Some(LevelFilter::Warn),
+        )
+        .await
+        .unwrap();
         log::trace!("Hi!");
         log::debug!("Hi!");
         log::info!("Hi!");
         log::warn!("Hi!");
         log::error!("Hi!");
         handle.end().await;
-        
+
         // Test output
         let mut file = File::open(path).await.unwrap();
         let mut content = String::new();
@@ -396,19 +393,25 @@ mod tests {
         assert!(lines[1].starts_with("[ERROR]") && lines[0].ends_with("Hi!"));
         tmp.close().unwrap();
     }
-    
+
     #[tokio::test(flavor = "multi_thread")]
     async fn level2() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init("info", Some(path), Some("off")).await.unwrap();
+        let handle = init(
+            LevelFilter::Info,
+            Some(path.to_string()),
+            Some(LevelFilter::Off),
+        )
+        .await
+        .unwrap();
         log::trace!("Hi!");
         log::debug!("Hi!");
         log::info!("Hi!");
         log::warn!("Hi!");
         log::error!("Hi!");
         handle.end().await;
-        
+
         // Test output
         let mut file = File::open(path).await.unwrap();
         let mut content = String::new();
