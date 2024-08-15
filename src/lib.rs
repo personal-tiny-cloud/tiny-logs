@@ -37,7 +37,7 @@
 //!
 //! // Level filter for the terminal's output - path to a log file - level filter of the log file
 //! // Remember to show the error to the user if there's any.
-//! let logger = tiny_logs::init(LevelFilter::Info, Some(path_to_logfile), Some(LevelFilter::Warn)).await.unwrap();
+//! tiny_logs::init(LevelFilter::Info, Some(path_to_logfile), LevelFilter::Warn).await.unwrap();
 //!
 //! // -- Anywhere in the code --
 //!
@@ -47,13 +47,13 @@
 //! // --------------------------
 //!
 //! // Remember to always close the logger at the end of the program
-//! // to ensure that everything is written correctly.
-//! logger.end().await;
+//! // to ensure that everything is written and closed correctly.
+//! tiny_logs::end().await;
 //! # tmp.close().unwrap();
 //! # });
 //! ```
 
-use std::pin::Pin;
+use std::{cmp::max, pin::Pin, sync::LazyLock};
 
 use log::{Level, LevelFilter, Metadata, Record};
 use owo_colors::{colors::css::DimGray, OwoColorize, Stream::Stdout};
@@ -62,9 +62,14 @@ use tokio::{
     fs::File,
     io::{self, AsyncWrite, AsyncWriteExt},
     pin,
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::{
+        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+        Mutex,
+    },
     task::{self, JoinHandle},
 };
+
+static LOGGER_HANDLER: LazyLock<Mutex<Option<LoggerHandler>>> = LazyLock::new(|| Mutex::new(None));
 
 static DATE_FMT: &[FormatItem] =
     format_description!("[year]/[month]/[day]-[hour]:[minute]:[second].[subsecond digits:2]");
@@ -84,20 +89,22 @@ fn create_log(record: &Record) -> String {
     };
 
     format!(
-        "{level} [{now}] {submod}- {args}\n",
+        "{level} [{now}]{submod}- {args}\n",
         now = now(),
-        submod = record.module_path().map(|m| format!("{m} ")).unwrap_or(
-            record
-                .module_path_static()
-                .map(|m| format!("{m} "))
-                .unwrap_or("".into())
-        ),
+        submod = {
+            if let Some(s) = record.module_path() {
+                format!(" {s} ")
+            } else if let Some(s) = record.module_path_static() {
+                format!(" {s} ")
+            } else {
+                " ".into()
+            }
+        },
         args = record.args()
     )
 }
 
 fn create_log_colored(record: &Record) -> String {
-    let now = format!("{}", now().if_supports_color(Stdout, |t| t.fg::<DimGray>()));
     let level = match record.level() {
         Level::Trace => format!(
             "{}",
@@ -120,16 +127,19 @@ fn create_log_colored(record: &Record) -> String {
             "[ERROR]".if_supports_color(Stdout, |t| t.truecolor(200, 31, 31))
         ),
     };
-    let module_path = if let Some(m) = record.module_path() {
-        format!(" {} ", m.if_supports_color(Stdout, |t| t.bold()))
-    } else if let Some(m) = record.module_path_static() {
-        format!(" {} ", m.if_supports_color(Stdout, |t| t.bold()))
-    } else {
-        " ".into()
-    };
 
     format!(
-        "{level} [{now}]{module_path}- {args}\n",
+        "{level} [{now}]{submod}- {args}\n",
+        now = now().if_supports_color(Stdout, |t| t.fg::<DimGray>()),
+        submod = {
+            if let Some(s) = record.module_path() {
+                format!(" {} ", s.if_supports_color(Stdout, |t| t.bold()))
+            } else if let Some(s) = record.module_path_static() {
+                format!(" {} ", s.if_supports_color(Stdout, |t| t.bold()))
+            } else {
+                " ".into()
+            }
+        },
         args = record.args()
     )
 }
@@ -137,7 +147,6 @@ fn create_log_colored(record: &Record) -> String {
 enum LogMsg {
     Stdout(String),
     File(String),
-    Both { out: String, filelog: String },
     Close,
 }
 
@@ -161,10 +170,6 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
             match log {
                 LogMsg::Stdout(log) => write_log(&mut stdout, log).await,
                 LogMsg::File(log) => write_log(&mut file, log).await,
-                LogMsg::Both { filelog, out } => {
-                    write_log(&mut file, filelog).await;
-                    write_log(&mut stdout, out).await;
-                }
                 LogMsg::Close => recv.close(),
             }
         }
@@ -172,7 +177,6 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
         while let Some(log) = recv.recv().await {
             match log {
                 LogMsg::Stdout(log) => write_log(&mut stdout, log).await,
-                LogMsg::Both { out, .. } => write_log(&mut stdout, out).await,
                 LogMsg::Close => recv.close(),
                 _ => (),
             }
@@ -186,19 +190,18 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
 /// - `file`: Outputs logs to this path (Optional, if [`None`] outputs just to the standard output).
 /// - `file_level`: Log level filter of the file (Optional, if [`None`] uses `level`, or `off` if file is none) (See [`LevelFilter`]).
 ///
-/// # Return
+/// At the end of your program, you must call [`end`] to end the logger correctly.
 ///
-/// Returns [`TinyLogger`]'s [`LoggerHandler`]. You must call [`LoggerHandler::end`] at the end
-/// of the program to end the logger and ensure that the last logs are logged.
+/// # Return
 ///
 /// On error it returns an error message that can be displayed to the user.
 pub async fn init(
     level: LevelFilter,
     file: Option<String>,
-    file_level: Option<LevelFilter>,
-) -> Result<LoggerHandler, String> {
+    mut file_level: LevelFilter,
+) -> Result<(), String> {
     let file: Option<File> = match file {
-        Some(path) => Some(
+        Some(path) if file_level != LevelFilter::Off => Some(
             File::options()
                 .create(true)
                 .append(true)
@@ -206,44 +209,49 @@ pub async fn init(
                 .await
                 .map_err(|e| format!("Failed to open log file: {e}"))?,
         ),
-        None => None,
+        Some(_) => None,
+        None => {
+            file_level = LevelFilter::Off;
+            None
+        }
     };
     let (send, recv) = unbounded_channel::<LogMsg>();
 
-    let file_level = if file.is_some() {
-        file_level.unwrap_or(level)
-    } else {
-        LevelFilter::Off
-    };
     let logger = Box::new(TinyLogger {
         level,
         file_level,
         sender: send.clone(),
     });
     log::set_boxed_logger(logger)
-        .map(|_| log::set_max_level(std::cmp::max(level, file_level)))
+        .map(|_| log::set_max_level(max(level, file_level)))
         .map_err(|e| format!("Failed to initialize logger: {e}"))?;
 
     let joinhandle = task::spawn(async move { writer(recv, file).await });
-    Ok(LoggerHandler {
+
+    let handler = &mut *LOGGER_HANDLER.lock().await;
+    handler.replace(LoggerHandler {
         sender: send,
         joinhandle,
-    })
+    });
+    Ok(())
 }
 
-/// Handles the logger.
-///
-/// Call [`LoggerHandler::end`] before the program exits.
-pub struct LoggerHandler {
+/// Must be called at the end of your program.
+pub async fn end() {
+    let handler = &mut *LOGGER_HANDLER.lock().await;
+    if let Some(handler) = handler.take() {
+        handler.end().await;
+    }
+}
+
+struct LoggerHandler {
     sender: UnboundedSender<LogMsg>,
     joinhandle: JoinHandle<()>,
 }
 
 impl LoggerHandler {
-    /// Ends the logger, call this method before the program ends.
-    ///
     /// Ensures that all the last logs are logged.
-    pub async fn end(self) {
+    async fn end(self) {
         self.sender
             .send(LogMsg::Close)
             .expect("Logger was already closed.");
@@ -274,17 +282,12 @@ impl log::Log for TinyLogger {
         if self.sender.is_closed() || !self.enabled(metadata) {
             return;
         }
+
         let lvl = metadata.level();
-        let stdout_level = lvl <= self.level;
-        let file_level = lvl <= self.file_level;
-        if stdout_level && file_level {
-            let _ = self.sender.send(LogMsg::Both {
-                out: create_log_colored(record),
-                filelog: create_log(record),
-            });
-        } else if stdout_level {
+        if lvl <= self.level {
             let _ = self.sender.send(LogMsg::Stdout(create_log_colored(record)));
-        } else if file_level {
+        }
+        if lvl <= self.file_level {
             let _ = self.sender.send(LogMsg::File(create_log(record)));
         }
     }
@@ -301,21 +304,25 @@ mod tests {
     use tempfile::NamedTempFile;
     use tokio::{fs::File, io::AsyncReadExt};
 
-    use crate::init;
+    use crate::{end, init};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn logging1() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init(LevelFilter::Trace, Some(path.to_string()), None)
-            .await
-            .unwrap();
+        init(
+            LevelFilter::Trace,
+            Some(path.to_string()),
+            LevelFilter::Trace,
+        )
+        .await
+        .unwrap();
         log::trace!("hello");
         log::debug!("hello");
         log::info!("hello");
         log::warn!("hello");
         log::error!("hello");
-        handle.end().await;
+        end().await;
         log::info!("test");
 
         // Test output
@@ -336,19 +343,15 @@ mod tests {
     async fn logging2() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init(
-            LevelFilter::Off,
-            Some(path.to_string()),
-            Some(LevelFilter::Trace),
-        )
-        .await
-        .unwrap();
+        init(LevelFilter::Off, Some(path.to_string()), LevelFilter::Trace)
+            .await
+            .unwrap();
         log::trace!("hello");
         log::debug!("hello");
         log::info!("hello");
         log::warn!("hello");
         log::error!("hello");
-        handle.end().await;
+        end().await;
         log::info!("test");
 
         // Test output
@@ -369,19 +372,15 @@ mod tests {
     async fn level1() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init(
-            LevelFilter::Info,
-            Some(path.to_string()),
-            Some(LevelFilter::Warn),
-        )
-        .await
-        .unwrap();
+        init(LevelFilter::Info, Some(path.to_string()), LevelFilter::Warn)
+            .await
+            .unwrap();
         log::trace!("Hi!");
         log::debug!("Hi!");
         log::info!("Hi!");
         log::warn!("Hi!");
         log::error!("Hi!");
-        handle.end().await;
+        end().await;
 
         // Test output
         let mut file = File::open(path).await.unwrap();
@@ -398,19 +397,37 @@ mod tests {
     async fn level2() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        let handle = init(
-            LevelFilter::Info,
-            Some(path.to_string()),
-            Some(LevelFilter::Off),
-        )
-        .await
-        .unwrap();
+        init(LevelFilter::Info, Some(path.to_string()), LevelFilter::Off)
+            .await
+            .unwrap();
         log::trace!("Hi!");
         log::debug!("Hi!");
         log::info!("Hi!");
         log::warn!("Hi!");
         log::error!("Hi!");
-        handle.end().await;
+        end().await;
+
+        // Test output
+        let mut file = File::open(path).await.unwrap();
+        let mut content = String::new();
+        file.read_to_string(&mut content).await.unwrap();
+        assert_eq!(content.len(), 0);
+        tmp.close().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn level3() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().as_os_str().to_str().unwrap();
+        init(LevelFilter::Info, None, LevelFilter::Info)
+            .await
+            .unwrap();
+        log::trace!("Hi!");
+        log::debug!("Hi!");
+        log::info!("Hi!");
+        log::warn!("Hi!");
+        log::error!("Hi!");
+        end().await;
 
         // Test output
         let mut file = File::open(path).await.unwrap();
