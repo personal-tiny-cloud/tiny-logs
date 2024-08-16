@@ -68,9 +68,9 @@ checksum = "8318a53db07bb3f8dca91a600466bdb3f2eaadeedfdbcf02e1accbad9271ba50"
 
 [[package]]
 name = "cc"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68064e60dbf1f17005c2fde4d07c16d8baa506fd7ffed8ccab702d93617975c7"
+checksum = "72db2f7947ecee9b03b510377e8bb9077afa27176fdbff55c51027e976fdcc48"
 dependencies = [
  "shlex",
 ]
@@ -363,8 +363,9 @@ dependencies = [
 
 [[package]]
 name = "tiny-logs"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
+ "libc",
  "log",
  "owo-colors",
  "tempfile",

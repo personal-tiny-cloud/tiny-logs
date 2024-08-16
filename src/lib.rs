@@ -22,10 +22,21 @@
 #![warn(missing_docs)]
 //! # Simple logger for Tiny Cloud.
 //!
-//! This is the default logger of [Tiny Cloud](https://github.com/personal-tiny-cloud/tiny-cloud).
-//! It uses [`tokio`] as a backend to log files asynchronously.
+//! This is [Tiny Cloud](https://github.com/personal-tiny-cloud/tiny-cloud)'s logger.
 //!
-//! It implements [`log::Log`] of the [`log`] crate.
+//! tiny-logs uses [`tokio`] as a backend to log files asynchronously to avoid blocking operations
+//! (like writing to files or to stdout) during the execution of the program.
+//!
+//! It is also able to log by using libc's [syslog](https://www.man7.org/linux/man-pages/man3/openlog.3.html)
+//! (feature `syslog`). Since it is part of the Standard C Library, it should cover most platforms.
+//! On Linux, logs made with `syslog()` will be saved to either syslogd or systemd-journald (depending on the system).
+//!
+//! This feature is useful for low-spec hardware where logging to files might slow down the
+//! system. For example, Raspberry Pis usually prefer using RAM logs for their system logs,
+//! due to their slow writing speed. It might not be useful on systems with systemd, because the
+//! standard output of every daemon is logged by default.
+//!
+//! It implements [`log::Log`] of the [`log`] crate. Logging has to be done by using its macros.
 //!
 //! # Usage
 //!
@@ -35,15 +46,21 @@
 //! # let path_to_logfile = tmp.path().as_os_str().to_str().unwrap().to_string();
 //! use log::LevelFilter;
 //!
-//! // Level filter for the terminal's output - path to a log file - level filter of the log file
+//! // 1. Level filter for the terminal's output.
+//! // 2. Path to a log file.
+//! // 3. Level filter of the log file.
+//! // 4. (feature 'syslog') Level filter of the system logger.
 //! // Remember to show the error to the user if there's any.
-//! tiny_logs::init(LevelFilter::Info, Some(path_to_logfile), LevelFilter::Warn).await.unwrap();
+//! tiny_logs::init(
+//!     LevelFilter::Info,
+//!     Some(path_to_logfile),
+//!     LevelFilter::Warn,
+//!     #[cfg(feature = "syslog")] LevelFilter::Error
+//! ).await.unwrap();
 //!
 //! // -- Anywhere in the code --
-//!
 //! log::info!("Some useful info");
 //! log::error!("An error");
-//!
 //! // --------------------------
 //!
 //! // Remember to always close the logger at the end of the program
@@ -52,6 +69,9 @@
 //! # tmp.close().unwrap();
 //! # });
 //! ```
+
+#[cfg(feature = "syslog")]
+mod syslog;
 
 use std::{cmp::max, pin::Pin, sync::LazyLock};
 
@@ -79,7 +99,7 @@ fn now() -> String {
     now.format(DATE_FMT).unwrap_or(now.to_string())
 }
 
-fn create_log(record: &Record) -> String {
+fn create_log(record: &Record, args: &str, now: &str) -> String {
     let level = match record.level() {
         Level::Trace => "[TRACE]",
         Level::Debug => "[DEBUG]",
@@ -90,7 +110,6 @@ fn create_log(record: &Record) -> String {
 
     format!(
         "{level} [{now}]{submod}- {args}\n",
-        now = now(),
         submod = {
             if let Some(s) = record.module_path() {
                 format!(" {s} ")
@@ -99,12 +118,11 @@ fn create_log(record: &Record) -> String {
             } else {
                 " ".into()
             }
-        },
-        args = record.args()
+        }
     )
 }
 
-fn create_log_colored(record: &Record) -> String {
+fn create_log_colored(record: &Record, args: &str, now: &str) -> String {
     let level = match record.level() {
         Level::Trace => format!(
             "{}",
@@ -130,7 +148,7 @@ fn create_log_colored(record: &Record) -> String {
 
     format!(
         "{level} [{now}]{submod}- {args}\n",
-        now = now().if_supports_color(Stdout, |t| t.fg::<DimGray>()),
+        now = now.if_supports_color(Stdout, |t| t.fg::<DimGray>()),
         submod = {
             if let Some(s) = record.module_path() {
                 format!(" {} ", s.if_supports_color(Stdout, |t| t.bold()))
@@ -139,14 +157,15 @@ fn create_log_colored(record: &Record) -> String {
             } else {
                 " ".into()
             }
-        },
-        args = record.args()
+        }
     )
 }
 
 enum LogMsg {
     Stdout(String),
     File(String),
+    #[cfg(feature = "syslog")]
+    Syslog(Level, String),
     Close,
 }
 
@@ -170,6 +189,8 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
             match log {
                 LogMsg::Stdout(log) => write_log(&mut stdout, log).await,
                 LogMsg::File(log) => write_log(&mut file, log).await,
+                #[cfg(feature = "syslog")]
+                LogMsg::Syslog(level, log) => syslog::log(level, log).await,
                 LogMsg::Close => recv.close(),
             }
         }
@@ -177,6 +198,8 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
         while let Some(log) = recv.recv().await {
             match log {
                 LogMsg::Stdout(log) => write_log(&mut stdout, log).await,
+                #[cfg(feature = "syslog")]
+                LogMsg::Syslog(level, log) => syslog::log(level, log).await,
                 LogMsg::Close => recv.close(),
                 _ => (),
             }
@@ -189,6 +212,7 @@ async fn writer(mut recv: UnboundedReceiver<LogMsg>, file: Option<File>) {
 /// - `level`: Log level filter (See [`LevelFilter`]).
 /// - `file`: Outputs logs to this path (Optional, if [`None`] outputs just to the standard output).
 /// - `file_level`: Log level filter of the file (Optional, if [`None`] uses `level`, or `off` if file is none) (See [`LevelFilter`]).
+/// - `syslog_level`: (feature `syslog`) Log level filter for the system logger (See [`LevelFilter`]).
 ///
 /// At the end of your program, you must call [`end`] to end the logger correctly.
 ///
@@ -199,6 +223,7 @@ pub async fn init(
     level: LevelFilter,
     file: Option<String>,
     mut file_level: LevelFilter,
+    #[cfg(feature = "syslog")] syslog_level: LevelFilter,
 ) -> Result<(), String> {
     let file: Option<File> = match file {
         Some(path) if file_level != LevelFilter::Off => Some(
@@ -220,13 +245,19 @@ pub async fn init(
     let logger = Box::new(TinyLogger {
         level,
         file_level,
+        #[cfg(feature = "syslog")]
+        syslog_level,
         sender: send.clone(),
     });
+
+    #[cfg(feature = "syslog")]
+    syslog::init(syslog_level).await;
+
+    let joinhandle = task::spawn(async move { writer(recv, file).await });
+
     log::set_boxed_logger(logger)
         .map(|_| log::set_max_level(max(level, file_level)))
         .map_err(|e| format!("Failed to initialize logger: {e}"))?;
-
-    let joinhandle = task::spawn(async move { writer(recv, file).await });
 
     let handler = &mut *LOGGER_HANDLER.lock().await;
     handler.replace(LoggerHandler {
@@ -255,9 +286,13 @@ impl LoggerHandler {
         self.sender
             .send(LogMsg::Close)
             .expect("Logger was already closed.");
+
         self.joinhandle
             .await
             .expect("Failed to close the writer's task");
+
+        #[cfg(feature = "syslog")]
+        syslog::close().await;
     }
 }
 
@@ -268,13 +303,24 @@ impl LoggerHandler {
 pub struct TinyLogger {
     level: LevelFilter,
     file_level: LevelFilter,
+    #[cfg(feature = "syslog")]
+    syslog_level: LevelFilter,
     sender: UnboundedSender<LogMsg>,
 }
 
 impl log::Log for TinyLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         let lvl = metadata.level();
-        lvl <= self.level || lvl <= self.file_level
+
+        #[cfg(feature = "syslog")]
+        {
+            lvl <= self.level || lvl <= self.file_level || lvl <= self.syslog_level
+        }
+
+        #[cfg(not(feature = "syslog"))]
+        {
+            lvl <= self.level || lvl <= self.file_level
+        }
     }
 
     fn log(&self, record: &Record) {
@@ -283,12 +329,25 @@ impl log::Log for TinyLogger {
             return;
         }
 
+        let now = now();
+        let args = format!("{}", record.args());
         let lvl = metadata.level();
+
         if lvl <= self.level {
-            let _ = self.sender.send(LogMsg::Stdout(create_log_colored(record)));
+            let _ = self
+                .sender
+                .send(LogMsg::Stdout(create_log_colored(record, &args, &now)));
         }
+
         if lvl <= self.file_level {
-            let _ = self.sender.send(LogMsg::File(create_log(record)));
+            let _ = self
+                .sender
+                .send(LogMsg::File(create_log(record, &args, &now)));
+        }
+
+        #[cfg(feature = "syslog")]
+        if lvl <= self.syslog_level {
+            let _ = self.sender.send(LogMsg::Syslog(lvl, args));
         }
     }
 
@@ -314,16 +373,18 @@ mod tests {
             LevelFilter::Trace,
             Some(path.to_string()),
             LevelFilter::Trace,
+            #[cfg(feature = "syslog")]
+            LevelFilter::Trace,
         )
         .await
         .unwrap();
-        log::trace!("hello");
-        log::debug!("hello");
-        log::info!("hello");
-        log::warn!("hello");
-        log::error!("hello");
+        log::trace!("logging1");
+        log::debug!("logging1");
+        log::info!("logging1");
+        log::warn!("logging1");
+        log::error!("logging1");
         end().await;
-        log::info!("test");
+        log::info!("test!");
 
         // Test output
         let mut file = File::open(path).await.unwrap();
@@ -331,11 +392,11 @@ mod tests {
         file.read_to_string(&mut content).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 5);
-        assert!(lines[0].starts_with("[TRACE]") && lines[0].ends_with("hello"));
-        assert!(lines[1].starts_with("[DEBUG]") && lines[0].ends_with("hello"));
-        assert!(lines[2].starts_with("[INFO]") && lines[0].ends_with("hello"));
-        assert!(lines[3].starts_with("[WARN]") && lines[0].ends_with("hello"));
-        assert!(lines[4].starts_with("[ERROR]") && lines[0].ends_with("hello"));
+        assert!(lines[0].starts_with("[TRACE]") && lines[0].ends_with("logging1"));
+        assert!(lines[1].starts_with("[DEBUG]") && lines[0].ends_with("logging1"));
+        assert!(lines[2].starts_with("[INFO]") && lines[0].ends_with("logging1"));
+        assert!(lines[3].starts_with("[WARN]") && lines[0].ends_with("logging1"));
+        assert!(lines[4].starts_with("[ERROR]") && lines[0].ends_with("logging1"));
         tmp.close().unwrap();
     }
 
@@ -343,14 +404,20 @@ mod tests {
     async fn logging2() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        init(LevelFilter::Off, Some(path.to_string()), LevelFilter::Trace)
-            .await
-            .unwrap();
-        log::trace!("hello");
-        log::debug!("hello");
-        log::info!("hello");
-        log::warn!("hello");
-        log::error!("hello");
+        init(
+            LevelFilter::Off,
+            Some(path.to_string()),
+            LevelFilter::Trace,
+            #[cfg(feature = "syslog")]
+            LevelFilter::Off,
+        )
+        .await
+        .unwrap();
+        log::trace!("logging2");
+        log::debug!("logging2");
+        log::info!("logging2");
+        log::warn!("logging2");
+        log::error!("logging2");
         end().await;
         log::info!("test");
 
@@ -360,11 +427,11 @@ mod tests {
         file.read_to_string(&mut content).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 5);
-        assert!(lines[0].starts_with("[TRACE]") && lines[0].ends_with("hello"));
-        assert!(lines[1].starts_with("[DEBUG]") && lines[0].ends_with("hello"));
-        assert!(lines[2].starts_with("[INFO]") && lines[0].ends_with("hello"));
-        assert!(lines[3].starts_with("[WARN]") && lines[0].ends_with("hello"));
-        assert!(lines[4].starts_with("[ERROR]") && lines[0].ends_with("hello"));
+        assert!(lines[0].starts_with("[TRACE]") && lines[0].ends_with("logging2"));
+        assert!(lines[1].starts_with("[DEBUG]") && lines[0].ends_with("logging2"));
+        assert!(lines[2].starts_with("[INFO]") && lines[0].ends_with("logging2"));
+        assert!(lines[3].starts_with("[WARN]") && lines[0].ends_with("logging2"));
+        assert!(lines[4].starts_with("[ERROR]") && lines[0].ends_with("logging2"));
         tmp.close().unwrap();
     }
 
@@ -372,14 +439,20 @@ mod tests {
     async fn level1() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        init(LevelFilter::Info, Some(path.to_string()), LevelFilter::Warn)
-            .await
-            .unwrap();
-        log::trace!("Hi!");
-        log::debug!("Hi!");
-        log::info!("Hi!");
-        log::warn!("Hi!");
-        log::error!("Hi!");
+        init(
+            LevelFilter::Info,
+            Some(path.to_string()),
+            LevelFilter::Warn,
+            #[cfg(feature = "syslog")]
+            LevelFilter::Debug,
+        )
+        .await
+        .unwrap();
+        log::trace!("level1");
+        log::debug!("level1");
+        log::info!("level1");
+        log::warn!("level1");
+        log::error!("level1");
         end().await;
 
         // Test output
@@ -388,8 +461,8 @@ mod tests {
         file.read_to_string(&mut content).await.unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("[WARN]") && lines[0].ends_with("Hi!"));
-        assert!(lines[1].starts_with("[ERROR]") && lines[0].ends_with("Hi!"));
+        assert!(lines[0].starts_with("[WARN]") && lines[0].ends_with("level1"));
+        assert!(lines[1].starts_with("[ERROR]") && lines[0].ends_with("level1"));
         tmp.close().unwrap();
     }
 
@@ -397,14 +470,20 @@ mod tests {
     async fn level2() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        init(LevelFilter::Info, Some(path.to_string()), LevelFilter::Off)
-            .await
-            .unwrap();
-        log::trace!("Hi!");
-        log::debug!("Hi!");
-        log::info!("Hi!");
-        log::warn!("Hi!");
-        log::error!("Hi!");
+        init(
+            LevelFilter::Info,
+            Some(path.to_string()),
+            LevelFilter::Off,
+            #[cfg(feature = "syslog")]
+            LevelFilter::Warn,
+        )
+        .await
+        .unwrap();
+        log::trace!("level2");
+        log::debug!("level2");
+        log::info!("level2");
+        log::warn!("level2");
+        log::error!("level2");
         end().await;
 
         // Test output
@@ -419,14 +498,20 @@ mod tests {
     async fn level3() {
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path().as_os_str().to_str().unwrap();
-        init(LevelFilter::Info, None, LevelFilter::Info)
-            .await
-            .unwrap();
-        log::trace!("Hi!");
-        log::debug!("Hi!");
-        log::info!("Hi!");
-        log::warn!("Hi!");
-        log::error!("Hi!");
+        init(
+            LevelFilter::Info,
+            None,
+            LevelFilter::Info,
+            #[cfg(feature = "syslog")]
+            LevelFilter::Info,
+        )
+        .await
+        .unwrap();
+        log::trace!("level3");
+        log::debug!("level3");
+        log::info!("level3");
+        log::warn!("level3");
+        log::error!("level3");
         end().await;
 
         // Test output
