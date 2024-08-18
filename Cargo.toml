@@ -4,7 +4,7 @@ description = "Simple async logger for Tiny Cloud"
 authors = [ "hex0x0000 <hex0x0000@protonmail.com>" ]
 license = "GPL-3.0"
 repository = "https://github.com/personal-tiny-cloud/tiny-logs"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 
 [dependencies]

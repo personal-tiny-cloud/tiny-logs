@@ -254,9 +254,15 @@ pub async fn init(
     syslog::init(syslog_level).await;
 
     let joinhandle = task::spawn(async move { writer(recv, file).await });
+    
+    #[cfg(not(feature = "syslog"))]
+    let max_level = max(level, file_level);
+    
+    #[cfg(feature = "syslog")]
+    let max_level = max(level, max(file_level, syslog_level));
 
     log::set_boxed_logger(logger)
-        .map(|_| log::set_max_level(max(level, file_level)))
+        .map(|_| log::set_max_level(max_level))
         .map_err(|e| format!("Failed to initialize logger: {e}"))?;
 
     let handler = &mut *LOGGER_HANDLER.lock().await;
