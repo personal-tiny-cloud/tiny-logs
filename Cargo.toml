@@ -10,7 +10,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1.29", features = [ "fs", "io-std", "io-util", "sync", "rt" ] }
 log = { version = "0.4", features = [ "std" ] }
-owo-colors = { version = "4", features = [ "supports-colors" ] }
+owo-colors = { version = "4.1", features = [ "supports-colors" ] }
 time = { version = "0.3", features = [ "local-offset", "macros", "formatting" ] }
 libc = { version = "0.2", optional = true }
 
